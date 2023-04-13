@@ -17,30 +17,38 @@ class APIDumpHelper:
         if startstop_cb is None:
             startstop_cb = (lambda is_start: None)
         self.startstop_cb = startstop_cb
+        self.is_started = False
         self.update_interval = update_interval
         self.update_timer = None
         self.clients = {}
     def _stop(self):
         self.clients.clear()
-        if self.update_timer is None:
-            return
         reactor = self.printer.get_reactor()
         reactor.unregister_timer(self.update_timer)
         self.update_timer = None
+        if not self.is_started:
+            return reactor.NEVER
         try:
             self.startstop_cb(False)
         except self.printer.command_error as e:
             logging.exception("API Dump Helper stop callback error")
+            self.clients.clear()
+        self.is_started = False
+        if self.clients:
+            # New client started while in process of stopping
+            self._start()
         return reactor.NEVER
     def _start(self):
-        if self.update_timer is not None:
+        if self.is_started:
             return
+        self.is_started = True
         try:
             self.startstop_cb(True)
         except self.printer.command_error as e:
             logging.exception("API Dump Helper start callback error")
-            self._stop()
-            return
+            self.is_started = False
+            self.clients.clear()
+            raise
         reactor = self.printer.get_reactor()
         systime = reactor.monotonic()
         waketime = systime + self.update_interval
@@ -50,6 +58,11 @@ class APIDumpHelper:
         template = web_request.get_dict('response_template', {})
         self.clients[cconn] = template
         self._start()
+    def add_internal_client(self):
+        cconn = InternalDumpClient()
+        self.clients[cconn] = {}
+        self._start()
+        return cconn
     def _update(self, eventtime):
         try:
             msg = self.data_cb(eventtime)
@@ -68,6 +81,23 @@ class APIDumpHelper:
             tmp['params'] = msg
             cconn.send(tmp)
         return eventtime + self.update_interval
+
+# An "internal webhooks" wrapper for using APIDumpHelper internally
+class InternalDumpClient:
+    def __init__(self):
+        self.msgs = []
+        self.is_done = False
+    def get_messages(self):
+        return self.msgs
+    def finalize(self):
+        self.is_done = True
+    def is_closed(self):
+        return self.is_done
+    def send(self, msg):
+        self.msgs.append(msg)
+        if len(self.msgs) >= 10000:
+            # Avoid filling up memory with too many samples
+            self.finalize()
 
 # Extract stepper queue_step messages
 class DumpStepper:
@@ -117,7 +147,7 @@ class DumpStepper:
         mcu_pos = first.start_position
         start_position = self.mcu_stepper.mcu_to_commanded_position(mcu_pos)
         step_dist = self.mcu_stepper.get_step_dist()
-        if self.mcu_stepper.is_dir_inverted():
+        if self.mcu_stepper.get_dir_inverted()[0]:
             step_dist = -step_dist
         d = [(s.interval, s.step_count, s.add) for s in data]
         return {"data": d, "start_position": start_position,
